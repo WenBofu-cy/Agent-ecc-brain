@@ -1,191 +1,266 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-MemoryBus 全局记忆总线
-EM-Core-Agent 模块间通信的唯一中枢
-
+Agent-ecc-brain 认知大脑 · 主入口
 版本：V1.0
 原创提出者：文波福
 开源协议：CC BY-NC 4.0
 
 职责：
-  - 作为 ECC、MLNF-Mem、MCC 模块间消息路由的唯一中转站
-  - 每个模块通过 publish(topic, data) 发布消息，通过 subscribe(topic, callback) 订阅消息
-  - 支持同步和异步两种投递模式
-  - 维护模块注册表，支持按模块 ID 点对点路由
+  - 实例化全部 12 个 ECC 认知大脑模块
+  - 实现主循环：调用各模块的 CPEC 标准主方法
+  - 对接三总线架构（InternalBus + MemoryBus + CerebellumBus）
+  - 严格实施 ag-ecc-12 作为唯一对外网关的安全边界
+  - 提供端到端演示场景
 
-设计原则：
-  - 模块间不直接引用，全部通过 MemoryBus 解耦
-  - 每个 topic 对应一种消息类型，命名规范为 "模块ID.事件类型"
-  - 发布者不关心订阅者是谁，订阅者不关心消息来源
+修改记录：
+  - V1.0: 修正注册表校验逻辑，适配 ECC 模块 ID 格式；增强关闭日志；显式注册对端模块
+  - V1.0: 修复直接访问总线私有属性 _registered_modules，改用 is_module_registered()
+  - V1.0: 分离 MemoryBus 与 CerebellumBus 的回调函数，消除路由歧义
 """
 
-from typing import Dict, List, Callable, Any, Optional
-from collections import defaultdict
-from dataclasses import dataclass, field
 import time
-import uuid
-import threading
+import sys
+import os
+import re
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+# 三总线导入
+from memory_bus import InternalBus, MemoryBus
+
+# CerebellumBus 复用 MemoryBus 实现（规格要求的对外工具调用总线）
+CerebellumBus = MemoryBus  # 接口完全兼容，物理隔离实例
+
+# 导入模块注册表（用于校验，仅作参考）
+from module_registry import MODULE_REGISTRY
+
+# 导入全部 12 个 ECC 模块
+from ag_ecc_01_intent_parser import IntentParser
+from ag_ecc_02_task_planner import TaskPlanner
+from ag_ecc_03_tool_selector import ToolSelector
+from ag_ecc_04_safety_arbiter import SafetyArbiter
+from ag_ecc_05_memory_query import MemoryQueryGateway
+from ag_ecc_06_result_evaluator import ResultEvaluator
+from ag_ecc_07_working_memory import WorkingMemory
+from ag_ecc_08_metacognition import MetacognitionModule
+from ag_ecc_09_intrinsic_motivation import IntrinsicMotivation
+from ag_ecc_10_social_mind import SocialMindModule
+from ag_ecc_11_abstract_creation import AbstractCreation
+from ag_ecc_12_resource_scheduler import ResourceScheduler
 
 
-@dataclass
-class Message:
-    """总线消息"""
-    message_id: str = ""
-    topic: str = ""                      # 消息主题（如 "ag-mem-01.experience_query"）
-    source_module: str = ""              # 发布者模块 ID
-    target_module: str = ""              # 目标模块 ID（空表示广播）
-    data: Any = None                     # 消息负载
-    timestamp: float = field(default_factory=time.time)
-
-
-class MemoryBus:
+class AgentEccBrain:
     """
-    全局记忆总线
-
-    使用方式：
-        bus = MemoryBus()
-        
-        # 订阅
-        bus.subscribe("ag-mem-01.experience_query", handler_func)
-        bus.subscribe_to_module("ag-mem-01", handler_func)  # 接收发给该模块的所有消息
-        
-        # 发布
-        bus.publish("ag-mem-01.experience_query", {"user_id": "U001"})
-        bus.publish_to_module("ag-mem-02", "slot_query", {"user_id": "U001"})
-        
-        # 主循环轮询
-        bus.process_all()  # 同步处理所有待投递消息
+    ECC 认知大脑 主控类 V1.0
+    负责模块实例化、主循环调度、三总线安全架构
     """
+
+    # 允许的 ECC 模块 ID 格式
+    ECC_MODULE_ID_PATTERN = re.compile(r"^ag-ecc-\d{2}$")
 
     def __init__(self):
-        self._subscriptions: Dict[str, List[Callable]] = defaultdict(list)  # topic -> [handlers]
-        self._module_subscriptions: Dict[str, List[Callable]] = defaultdict(list)  # module_id -> [handlers]
-        self._message_queue: List[Message] = []
-        self._lock = threading.Lock()
-        self._message_counter: int = 0
-        self._pending_logs: List[Dict[str, Any]] = []
+        self.cycle_count = 0
+        self.running = True
 
-    # ========== 订阅接口 ==========
-    def subscribe(self, topic: str, handler: Callable[[Message], None]):
-        """订阅指定 topic 的消息"""
-        with self._lock:
-            self._subscriptions[topic].append(handler)
+        # ====================== 三总线架构 ======================
+        self.internal_bus = InternalBus(validate_modules=False)      # 模块间内部通信
+        self.external_bus = MemoryBus(validate_modules=False)        # 对外 MemoryBus（连接 MLNF）
+        self.cerebellum_bus = CerebellumBus(validate_modules=False)  # 对外工具调用总线（连接 MCC）
 
-    def subscribe_to_module(self, module_id: str, handler: Callable[[Message], None]):
-        """订阅发给指定模块的所有消息（按 target_module 过滤）"""
-        with self._lock:
-            self._module_subscriptions[module_id].append(handler)
+        # 模块ID → 实例映射
+        self.module_map = {}
 
-    # ========== 发布接口 ==========
-    def publish(self, topic: str, source_module: str, data: Any = None, target_module: str = ""):
+        # ========== 实例化全部 12 个模块 ==========
+        self.intent_parser = IntentParser()
+        self.task_planner = TaskPlanner()
+        self.tool_selector = ToolSelector()
+        self.safety_arbiter = SafetyArbiter()
+        self.memory_query = MemoryQueryGateway()
+        self.result_evaluator = ResultEvaluator()
+        self.working_memory = WorkingMemory()
+        self.metacognition = MetacognitionModule()
+        self.intrinsic_motivation = IntrinsicMotivation()
+        self.social_mind = SocialMindModule()
+        self.abstract_creation = AbstractCreation()
+        self.resource_scheduler = ResourceScheduler()
+
+        # 绑定模块ID、注入总线、注册模块、绑定回调
+        self._bind_module_ids()
+        self._validate_registry()   # 兼容注册表校验
+        self._inject_bus()
+        self._register_modules()
+        self._wire_callbacks()
+
+        print("Agent-ecc-brain 认知大脑 初始化完成")
+        print(f"  模块总数: {len(self.module_map)} (注册表校验通过)")
+
+    def _bind_module_ids(self):
+        """绑定ECC标准模块ID（CPEC V1.0 强制）"""
+        self.module_map = {
+            "ag-ecc-01": self.intent_parser,
+            "ag-ecc-02": self.task_planner,
+            "ag-ecc-03": self.tool_selector,
+            "ag-ecc-04": self.safety_arbiter,
+            "ag-ecc-05": self.memory_query,
+            "ag-ecc-06": self.result_evaluator,
+            "ag-ecc-07": self.working_memory,
+            "ag-ecc-08": self.metacognition,
+            "ag-ecc-09": self.intrinsic_motivation,
+            "ag-ecc-10": self.social_mind,
+            "ag-ecc-11": self.abstract_creation,
+            "ag-ecc-12": self.resource_scheduler,
+        }
+        for mid, module in self.module_map.items():
+            module.module_id = mid
+
+    def _validate_registry(self):
         """
-        发布消息到指定 topic
-
-        Args:
-            topic: 消息主题
-            source_module: 发布者模块 ID
-            data: 消息负载
-            target_module: 目标模块 ID（空表示广播给所有订阅该 topic 的模块）
+        注册表兼容性校验（V1.0 增强）
+        - ECC 模块 ID 格式检查
+        - 数量检查
+        - 若模块 ID 存在于 MEM 注册表中，则不做冲突检查；仅检查自身一致性。
         """
-        self._message_counter += 1
-        message = Message(
-            message_id=f"MSG-{self._message_counter:06d}",
-            topic=topic,
-            source_module=source_module,
-            target_module=target_module,
-            data=data
-        )
-        with self._lock:
-            self._message_queue.append(message)
+        # 1. 模块数量检查
+        if len(self.module_map) != 12:
+            raise RuntimeError(
+                f"ECC 模块数量异常: 期望 12 个，实际 {len(self.module_map)} 个"
+            )
 
-    def publish_to_module(self, target_module: str, event_type: str, source_module: str, data: Any = None):
-        """
-        向指定模块发布点对点消息
+        # 2. ID 格式检查
+        for mid in self.module_map:
+            if not self.ECC_MODULE_ID_PATTERN.match(mid):
+                raise RuntimeError(f"非法 ECC 模块 ID: {mid}")
 
-        Args:
-            target_module: 目标模块 ID
-            event_type: 事件类型
-            source_module: 发布者模块 ID
-            data: 消息负载
-        """
-        topic = f"{target_module}.{event_type}"
-        self.publish(topic, source_module, data, target_module)
+        # 3. 若注册表中已包含 ECC 模块，则做双向校验；否则只做格式/数量检查
+        ecc_in_registry = [mid for mid in self.module_map if mid in MODULE_REGISTRY]
+        if ecc_in_registry:
+            # 部分校验：已注册的 ECC 模块必须名称一致（可选）
+            for mid in ecc_in_registry:
+                expected_name = MODULE_REGISTRY[mid][0]  # 元组第一项是中文名称
+                print(f"  注意: ECC 模块 {mid} 已存在于记忆中枢注册表 ({expected_name})")
 
-    # ========== 消息处理 ==========
-    def process_one(self) -> int:
-        """
-        处理队列中的下一条消息（同步）
-        Returns:
-            处理的消息数（0 或 1）
-        """
-        with self._lock:
-            if not self._message_queue:
-                return 0
-            message = self._message_queue.pop(0)
+        # 4. 确保所有需要通信的对端模块在外部总线上注册
+        # 使用公共方法 is_module_registered 检查，避免访问私有属性
+        if not self.external_bus.is_module_registered("ag-mem-01"):
+            self.external_bus.register_module("ag-mem-01")
 
-        # 1. 投递给 topic 订阅者
-        handlers = self._subscriptions.get(message.topic, [])
-        for handler in handlers:
+    def _inject_bus(self):
+        """
+        注入三总线（严格遵循 ag-ecc-12 唯一对外网关原则）
+        - 所有模块获得内部总线 InternalBus
+        - 仅 ag-ecc-12 获得外部总线 MemoryBus 和 CerebellumBus
+        """
+        for mid, module in self.module_map.items():
+            module.bus = self.internal_bus
+
+        # 只有资源调度模块拥有对外通信能力（MemoryBus + CerebellumBus）
+        self.resource_scheduler.external_bus = self.external_bus
+        self.resource_scheduler.cerebellum_bus = self.cerebellum_bus
+
+    def _register_modules(self):
+        """注册模块到总线（内部总线所有模块，外部总线仅 ag-ecc-12）"""
+        for mid in self.module_map.keys():
+            self.internal_bus.register_module(mid)
+        # 外部总线仅注册网关模块
+        self.external_bus.register_module("ag-ecc-12")
+        self.cerebellum_bus.register_module("ag-ecc-12")
+
+    def _wire_callbacks(self):
+        """绑定模块消息回调，为不同总线使用不同的处理函数（消除路由歧义）"""
+        # 内部总线统一用 handle_message
+        for mid, module in self.module_map.items():
+            if hasattr(module, "handle_message"):
+                self.internal_bus.subscribe_to_module(mid, module.handle_message)
+
+        # 外部总线分离：MemoryBus 和 CerebellumBus 使用独立的回调
+        # 要求 ag-ecc-12 实现 handle_memory_bus_message 和 handle_cerebellum_bus_message
+        if hasattr(self.resource_scheduler, "handle_memory_bus_message"):
+            self.external_bus.subscribe_to_module(
+                "ag-ecc-12", self.resource_scheduler.handle_memory_bus_message
+            )
+        if hasattr(self.resource_scheduler, "handle_cerebellum_bus_message"):
+            self.cerebellum_bus.subscribe_to_module(
+                "ag-ecc-12", self.resource_scheduler.handle_cerebellum_bus_message
+            )
+
+    # ====================== 主循环 ======================
+    def run_cycle(self):
+        """
+        执行一个主循环周期（严格对齐 CPEC V1.0）
+        各模块的主方法名为 CPEC 规定的标准名称
+        """
+        # 1. 处理外部输入（来自 MLNF-Mem、MCC、用户交互等）
+        self.external_bus.process_batch(100)
+        self.cerebellum_bus.process_batch(100)
+        self.internal_bus.process_batch(100)
+
+        # 2. 按依赖顺序调用各模块主逻辑
+        self.intent_parser.intent_parser_main_loop()
+        self.task_planner.task_planner_main_loop()
+        self.tool_selector.tool_selector_main_loop()
+        self.safety_arbiter.safety_arbiter_main_loop()
+        self.memory_query.memory_query_main_loop()
+        self.result_evaluator.result_evaluator_main_loop()
+        self.working_memory.working_memory_main_loop()
+        self.metacognition.metacognition_main_loop()
+        self.intrinsic_motivation.intrinsic_motivation_main_loop()
+        self.social_mind.social_mind_main_loop()
+        self.abstract_creation.abstract_creation_main_loop()
+        self.resource_scheduler.resource_scheduler_main_loop()
+
+        # 3. 收尾处理（发送响应、广播状态等）
+        self.internal_bus.process_batch(100)
+        self.cerebellum_bus.process_batch(100)
+        self.external_bus.process_batch(100)
+
+        self.cycle_count += 1
+
+    def get_health_status(self):
+        """健康监控"""
+        return {
+            "cycle_count": self.cycle_count,
+            "running": self.running,
+            "loaded_modules": len(self.module_map),
+            "internal_pending": self.internal_bus.pending_count(),
+            "external_pending": self.external_bus.pending_count(),
+            "cerebellum_pending": self.cerebellum_bus.pending_count(),
+        }
+
+    def shutdown(self):
+        """安全关闭，逆序调用模块 shutdown 并记录异常"""
+        self.running = False
+        for mid in reversed(list(self.module_map.keys())):
+            module = self.module_map[mid]
             try:
-                handler(message)
+                if hasattr(module, "shutdown"):
+                    module.shutdown()
             except Exception as e:
-                self._log_error("topic_handler_error", str(e))
+                print(f"  [WARN] 关闭模块 {mid} 异常: {e}")
+        print("Agent-ecc-brain 已安全关闭")
 
-        # 2. 投递给目标模块的订阅者
-        if message.target_module:
-            module_handlers = self._module_subscriptions.get(message.target_module, [])
-            for handler in module_handlers:
-                try:
-                    handler(message)
-                except Exception as e:
-                    self._log_error("module_handler_error", str(e))
 
-        return 1
+def main():
+    print("=" * 70)
+    print("  Agent-ecc-brain 认知大脑 V1.0")
+    print("  原创提出者：文波福")
+    print("=" * 70)
 
-    def process_all(self) -> int:
-        """处理队列中的所有待投递消息（同步）"""
-        total = 0
-        while True:
-            processed = self.process_one()
-            if processed == 0:
-                break
-            total += processed
-        return total
+    brain = AgentEccBrain()
 
-    def process_batch(self, max_count: int = 50) -> int:
-        """处理最多 max_count 条消息"""
-        total = 0
-        for _ in range(max_count):
-            processed = self.process_one()
-            if processed == 0:
-                break
-            total += processed
-        return total
+    print("\n运行 3 个主循环周期...")
+    for i in range(3):
+        brain.run_cycle()
+        print(f"  周期 {i+1} 完成")
 
-    # ========== 查询接口 ==========
-    def pending_count(self) -> int:
-        """待处理消息数"""
-        with self._lock:
-            return len(self._message_queue)
+    health = brain.get_health_status()
+    print(f"\n✅ Agent-ecc-brain 演示完成")
+    print(f"  总周期数: {health['cycle_count']}")
+    print(f"  已加载模块: {health['loaded_modules']}/12")
+    print(f"  内部待处理消息: {health['internal_pending']}")
+    print(f"  外部待处理消息: {health['external_pending']}")
+    print(f"  小脑待处理消息: {health['cerebellum_pending']}")
 
-    def subscription_count(self) -> int:
-        """总订阅数"""
-        total = sum(len(v) for v in self._subscriptions.values())
-        total += sum(len(v) for v in self._module_subscriptions.values())
-        return total
 
-    # ========== 辅助 ==========
-    def _log_error(self, error_type: str, detail: str):
-        self._pending_logs.append({
-            "log_id": f"log-{uuid.uuid4().hex[:8]}",
-            "event_type": error_type,
-            "source_module": "MemoryBus",
-            "details": {"error": detail},
-            "timestamp": time.time()
-        })
-
-    def collect_pending_logs(self) -> List[Dict[str, Any]]:
-        logs = self._pending_logs.copy()
-        self._pending_logs.clear()
-        return logs
+if __name__ == "__main__":
+    main()
