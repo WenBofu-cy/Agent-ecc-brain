@@ -187,11 +187,16 @@ class TaskPlanner:
         self.state = PlannerState.WAITING_INTENT
         self.bus = None
 
+        # 统计相关变量
+        self._last_status_time = time.time()
+        self._total_planned = 0
+        self._total_planning_time = 0.0
+
         self._task_queue: List[StructuredIntent] = []
         self._active_plans: Dict[str, TaskPlan] = {}
         self._intent_buffer: List[StructuredIntent] = []
         self._receipt_buffer: List[Dict] = []
-        self._review_buffer: List[Dict] = []  # 改为列表，实现FIFO处理
+        self._review_buffer: List[Dict] = []
         self._interrupt_buffer: List[Dict] = []
         logger.info("任务规划模块初始化完成")
 
