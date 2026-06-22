@@ -5,11 +5,7 @@
 
 **EM-Core 通用智能体系 · AI Agent 专项 · 总规范仓库**
 
-> 版本：V1.0
-> 原创提出者：文波福
-> 开源协议：CC BY-NC 4.0（署名-非商业性使用 4.0 国际许可证）
-> 所属体系：EM-Core 通用智能架构
-> 同源体系：[EM-Core-HR](https://github.com
+
 
 #### Software Architecture
 Software architecture description
